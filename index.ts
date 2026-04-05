@@ -2,6 +2,7 @@ import { calculateCost, createAssistantMessageEventStream, getModels, type Assis
 import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
+import { parse as parsePartial } from "partial-json";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
@@ -43,6 +44,14 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
+/** Remove unpaired Unicode surrogates that can cause API errors. */
+function sanitizeSurrogates(text: string): string {
+	return text.replace(
+		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+		"",
+	);
+}
+
 const MODELS = getModels("anthropic").map((model) => ({
 	id: model.id,
 	name: model.name,
@@ -61,7 +70,7 @@ function buildPromptBlocks(
 	const blocks: ContentBlockParam[] = [];
 
 	const pushText = (text: string) => {
-		blocks.push({ type: "text", text });
+		blocks.push({ type: "text", text: sanitizeSurrogates(text) });
 	};
 
 	const pushImage = (image: ImageContent) => {
@@ -183,7 +192,7 @@ function contentToText(
 	if (!Array.isArray(content)) return "";
 	return content
 		.map((block) => {
-			if (block.type === "text") return block.text ?? "";
+			if (block.type === "text") return sanitizeSurrogates(block.text ?? "");
 			if (block.type === "thinking") return block.thinking ?? "";
 			if (block.type === "toolCall") {
 				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
@@ -540,11 +549,16 @@ function mapThinkingTokens(
 }
 
 function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
-	if (!input) return fallback;
+	if (!input || input.trim() === "") return fallback;
 	try {
 		return JSON.parse(input);
 	} catch {
-		return fallback;
+		try {
+			const result = parsePartial(input);
+			return (result ?? fallback) as Record<string, unknown>;
+		} catch {
+			return fallback;
+		}
 	}
 }
 
@@ -766,8 +780,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							const index = blocks.findIndex((block) => block.index === event.index);
 							const block = blocks[index];
 							if (!block) break;
-							delete (block as any).index;
 							if (block.type === "text") {
+								const cleanBlock = { type: "text" as const, text: block.text };
+								output.content[index] = cleanBlock;
 								stream.push({
 									type: "text_end",
 									contentIndex: index,
@@ -775,6 +790,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									partial: output,
 								});
 							} else if (block.type === "thinking") {
+								const cleanBlock = { type: "thinking" as const, thinking: block.thinking, thinkingSignature: block.thinkingSignature };
+								output.content[index] = cleanBlock;
 								stream.push({
 									type: "thinking_end",
 									contentIndex: index,
@@ -783,16 +800,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								});
 							} else if (block.type === "toolCall") {
 								sawToolCall = true;
-								block.arguments = mapToolArgs(
-									block.name,
-									parsePartialJson(block.partialJson, block.arguments),
-									allowSkillAliasRewrite,
-								);
-								delete (block as any).partialJson;
+								const cleanBlock = {
+									type: "toolCall" as const,
+									id: block.id,
+									name: block.name,
+									arguments: mapToolArgs(
+										block.name,
+										parsePartialJson(block.partialJson, block.arguments),
+										allowSkillAliasRewrite,
+									),
+								};
+								output.content[index] = cleanBlock;
 								stream.push({
 									type: "toolcall_end",
 									contentIndex: index,
-									toolCall: block,
+									toolCall: cleanBlock,
 									partial: output,
 								});
 							}
