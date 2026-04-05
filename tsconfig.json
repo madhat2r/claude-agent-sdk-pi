@@ -4,7 +4,8 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "types": ["node"],
-    "strict": false,
+    "strict": true,
     "skipLibCheck": true
-  }
+  },
+  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts"]
 }
