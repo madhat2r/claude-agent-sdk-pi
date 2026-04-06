@@ -48,6 +48,12 @@ function isRetryableError(error: unknown): boolean {
 	return RETRYABLE_PATTERN.test(message);
 }
 
+/** Detect transport errors that occur when writing to a closed connection during abort. */
+function isTransportCloseError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /write after (end|close)|transport.*closed|ERR_STREAM_DESTROYED/i.test(message);
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
@@ -127,6 +133,10 @@ export function streamClaudeAgentSdk(
 		let sawStreamEvent = false;
 		let sawToolCall = false;
 		let shouldStopEarly = false;
+		// Map event.index (global sequence number) → blocks array position.
+		// The API's event.index spans all content block types (text, thinking, tool_use)
+		// in a single namespace, so it doesn't match the array index directly.
+		const blockIndexMap = new Map<number, number>();
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
@@ -221,7 +231,9 @@ export function streamClaudeAgentSdk(
 							if (blockType === "text") {
 								const block = { type: "text" as const, text: "", index: blockIndex };
 								output.content.push(block);
-								stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+								const arrIdx = output.content.length - 1;
+								blockIndexMap.set(blockIndex, arrIdx);
+								stream.push({ type: "text_start", contentIndex: arrIdx, partial: output });
 							} else if (blockType === "thinking") {
 								const block = {
 									type: "thinking" as const,
@@ -230,7 +242,9 @@ export function streamClaudeAgentSdk(
 									index: blockIndex,
 								};
 								output.content.push(block);
-								stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+								const arrIdx = output.content.length - 1;
+								blockIndexMap.set(blockIndex, arrIdx);
+								stream.push({ type: "thinking_start", contentIndex: arrIdx, partial: output });
 							} else if (blockType === "redacted_thinking") {
 								// Handle redacted thinking — preserve the encrypted signature
 								// for multi-turn continuity
@@ -242,8 +256,9 @@ export function streamClaudeAgentSdk(
 									index: blockIndex,
 								};
 								output.content.push(block);
-								const idx = output.content.length - 1;
-								stream.push({ type: "thinking_start", contentIndex: idx, partial: output });
+								const arrIdx = output.content.length - 1;
+								blockIndexMap.set(blockIndex, arrIdx);
+								stream.push({ type: "thinking_start", contentIndex: arrIdx, partial: output });
 								// Emit end immediately since redacted blocks have no deltas
 								const cleanBlock = {
 									type: "thinking" as const,
@@ -251,10 +266,10 @@ export function streamClaudeAgentSdk(
 									thinkingSignature: block.thinkingSignature,
 									redacted: true,
 								};
-								output.content[idx] = cleanBlock;
+								output.content[arrIdx] = cleanBlock;
 								stream.push({
 									type: "thinking_end",
-									contentIndex: idx,
+									contentIndex: arrIdx,
 									content: "[Reasoning redacted]",
 									partial: output,
 								});
@@ -269,7 +284,9 @@ export function streamClaudeAgentSdk(
 									index: blockIndex,
 								};
 								output.content.push(block);
-								stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+								const arrIdx = output.content.length - 1;
+								blockIndexMap.set(blockIndex, arrIdx);
+								stream.push({ type: "toolcall_start", contentIndex: arrIdx, partial: output });
 							}
 							break;
 						}
@@ -280,57 +297,46 @@ export function streamClaudeAgentSdk(
 							if (!delta) break;
 
 							const deltaType = delta.type as string;
+							const arrIdx = blockIndexMap.get(blockIndex);
+							if (arrIdx === undefined) break;
+							const block = blocks[arrIdx];
+							if (!block) break;
 
-							if (deltaType === "text_delta") {
-								const index = blocks.findIndex((block) => block.index === blockIndex);
-								const block = blocks[index];
-								if (block?.type === "text") {
-									block.text += delta.text as string;
-									stream.push({
-										type: "text_delta",
-										contentIndex: index,
-										delta: delta.text as string,
-										partial: output,
-									});
-								}
-							} else if (deltaType === "thinking_delta") {
-								const index = blocks.findIndex((block) => block.index === blockIndex);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinking += delta.thinking as string;
-									stream.push({
-										type: "thinking_delta",
-										contentIndex: index,
-										delta: delta.thinking as string,
-										partial: output,
-									});
-								}
-							} else if (deltaType === "input_json_delta") {
-								const index = blocks.findIndex((block) => block.index === blockIndex);
-								const block = blocks[index];
-								if (block?.type === "toolCall") {
-									block.partialJson += delta.partial_json as string;
-									block.arguments = parsePartialJson(block.partialJson, block.arguments);
-									stream.push({
-										type: "toolcall_delta",
-										contentIndex: index,
-										delta: delta.partial_json as string,
-										partial: output,
-									});
-								}
-							} else if (deltaType === "signature_delta") {
-								const index = blocks.findIndex((block) => block.index === blockIndex);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinkingSignature = (block.thinkingSignature ?? "") + (delta.signature as string);
-								}
+							if (deltaType === "text_delta" && block.type === "text") {
+								block.text += delta.text as string;
+								stream.push({
+									type: "text_delta",
+									contentIndex: arrIdx,
+									delta: delta.text as string,
+									partial: output,
+								});
+							} else if (deltaType === "thinking_delta" && block.type === "thinking") {
+								block.thinking += delta.thinking as string;
+								stream.push({
+									type: "thinking_delta",
+									contentIndex: arrIdx,
+									delta: delta.thinking as string,
+									partial: output,
+								});
+							} else if (deltaType === "input_json_delta" && block.type === "toolCall") {
+								block.partialJson += delta.partial_json as string;
+								block.arguments = parsePartialJson(block.partialJson, block.arguments);
+								stream.push({
+									type: "toolcall_delta",
+									contentIndex: arrIdx,
+									delta: delta.partial_json as string,
+									partial: output,
+								});
+							} else if (deltaType === "signature_delta" && block.type === "thinking") {
+								block.thinkingSignature = (block.thinkingSignature ?? "") + (delta.signature as string);
 							}
 							break;
 						}
 
 						if (eventType === "content_block_stop") {
 							const blockIndex = event.index as number;
-							const index = blocks.findIndex((block) => block.index === blockIndex);
+							const index = blockIndexMap.get(blockIndex);
+							if (index === undefined) break;
 							const block = blocks[index];
 							if (!block) break;
 
@@ -444,10 +450,28 @@ export function streamClaudeAgentSdk(
 						if (shouldStopEarly) break;
 					}
 
+					// Remove incomplete tool call blocks that were never finalized
+					// (e.g., stream was aborted or stopped early before content_block_stop)
+					for (let i = blocks.length - 1; i >= 0; i--) {
+						const block = blocks[i];
+						if (block && block.type === "toolCall" && "partialJson" in block) {
+							if (!block.id || Object.keys(block.arguments).length === 0) {
+								output.content.splice(i, 1);
+							}
+						}
+					}
+
 					// Success — clear last error and break out of retry loop
 					lastError = undefined;
 					break;
 				} catch (error) {
+					// Transport write-after-close errors are expected during abort —
+					// the SDK may try to write to a closed connection. Silently ignore.
+					if (isTransportCloseError(error)) {
+						lastError = undefined;
+						break;
+					}
+
 					lastError = error;
 
 					// If we already started streaming, we can't retry — the consumer
