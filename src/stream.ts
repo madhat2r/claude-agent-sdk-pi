@@ -14,6 +14,7 @@ import { loadProviderSettings, extractAgentsAppend, extractSkillsAppend } from "
 import { mapThinkingTokens } from "./thinking.js";
 import { buildPromptBlocks, buildPromptStream } from "./prompt.js";
 import { TOOL_EXECUTION_DENIED_MESSAGE } from "./types.js";
+import { sessionKeyFromId, getActiveSessionKey, reconcileWithContext, buildToolWatchNote } from "./ledger.js";
 
 /** Patterns that identify transient/retryable errors. */
 const RETRYABLE_PATTERN =
@@ -140,7 +141,14 @@ export function streamClaudeAgentSdk(
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
-			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
+			const sessionKey = options?.sessionId
+				? sessionKeyFromId(options.sessionId)
+				: getActiveSessionKey();
+			if (sessionKey) {
+				reconcileWithContext(sessionKey, context);
+			}
+			const toolWatchNote = buildToolWatchNote(sessionKey, context, customToolNameToSdk);
+			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk, toolWatchNote);
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 

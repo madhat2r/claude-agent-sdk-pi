@@ -125,7 +125,7 @@ describe("buildPromptBlocks", () => {
 		const result = buildPromptBlocks(context, undefined);
 		const texts = result.filter((b) => b.type === "text").map((b) => (b as { text: string }).text);
 		const joined = texts.join("");
-		expect(joined).toContain("TOOL RESULT (historical Read):");
+		expect(joined).toContain("TOOL RESULT (historical Read, id=tc_789):");
 		expect(joined).toContain("file contents here");
 	});
 });

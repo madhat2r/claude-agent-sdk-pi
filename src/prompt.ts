@@ -14,6 +14,7 @@ import { mapPiToolNameToSdk } from "./tools.js";
 export function buildPromptBlocks(
 	context: Context,
 	customToolNameToSdk: Map<string, string> | undefined,
+	toolWatchNote?: string,
 ): ContentBlockParam[] {
 	const blocks: ContentBlockParam[] = [];
 
@@ -136,7 +137,9 @@ export function buildPromptBlocks(
 				pendingToolCallIds.delete(toolResultMsg.toolCallId);
 			}
 
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
+			const toolCallId = (message as { toolCallId?: string }).toolCallId;
+			const idSuffix = toolCallId ? `, id=${toolCallId}` : "";
+			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}${idSuffix}):`;
 			pushPrefix(header);
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
@@ -151,6 +154,11 @@ export function buildPromptBlocks(
 			pushPrefix(`TOOL RESULT (historical, no result provided):`);
 			pushText(`Tool call ${id} received no result.`);
 		}
+	}
+
+	if (toolWatchNote && toolWatchNote.trim().length > 0) {
+		pushPrefix("RECOVERED TOOL RESULTS:");
+		pushText(toolWatchNote.trim());
 	}
 
 	if (!blocks.length) return [{ type: "text", text: "" }];
